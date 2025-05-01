@@ -1,11 +1,8 @@
-use log::debug;
 use reqwest::{Method, Response, Version};
 use std::{str::FromStr, time::Duration};
 use url::Url;
 
-use crate::{
-    emulation::Browser, http3::H3Engine, http_headers::HttpHeaders, request::RequestOptions, tls,
-};
+use crate::{emulation::Browser, http_headers::HttpHeaders, request::RequestOptions, tls};
 
 /// Error types that can be returned by the [`Impit`] struct.
 ///
@@ -32,8 +29,6 @@ pub enum ErrorType {
 /// To create a new [`Impit`] instance, use the [`Impit::builder()`](ImpitBuilder) method.
 pub struct Impit {
     pub(self) base_client: reqwest::Client,
-    pub(self) h3_client: Option<reqwest::Client>,
-    h3_engine: Option<H3Engine>,
     config: ImpitBuilder,
 }
 
@@ -178,10 +173,6 @@ impl Impit {
         let mut tls_config_builder = tls::TlsConfig::builder();
         let mut tls_config_builder = tls_config_builder.with_browser(config.browser);
 
-        if config.max_http_version == Version::HTTP_3 {
-            tls_config_builder = tls_config_builder.with_http3();
-        }
-
         tls_config_builder = tls_config_builder.with_ignore_tls_errors(config.ignore_tls_errors);
 
         let tls_config = tls_config_builder.build();
@@ -192,10 +183,6 @@ impl Impit {
             .use_preconfigured_tls(tls_config)
             .cookie_store(true)
             .timeout(config.request_timeout);
-
-        if config.max_http_version == Version::HTTP_3 {
-            client = client.http3_prior_knowledge();
-        }
 
         if config.proxy_url.len() > 0 {
             client = client.proxy(
@@ -218,23 +205,11 @@ impl Impit {
 
     /// Creates a new [`Impit`] instance based on the options stored in the [`ImpitBuilder`] instance.
     fn new(config: ImpitBuilder) -> Self {
-        let mut h3_client: Option<reqwest::Client> = None;
-        let mut base_client = Self::new_reqwest_client(&config).unwrap();
-
-        if config.max_http_version == Version::HTTP_3 {
-            h3_client = Some(base_client);
-            base_client = Self::new_reqwest_client(&ImpitBuilder {
-                max_http_version: Version::HTTP_2,
-                ..config.clone()
-            })
-            .unwrap();
-        }
+        let base_client = Self::new_reqwest_client(&config).unwrap();
 
         Impit {
             base_client,
-            h3_client,
             config,
-            h3_engine: None,
         }
     }
 
@@ -259,25 +234,8 @@ impl Impit {
         };
     }
 
-    async fn should_use_h3(self: &mut Self, host: &String) -> bool {
-        if self.config.max_http_version < Version::HTTP_3 {
-            debug!("HTTP/3 is disabled, falling back to TCP-based requests.");
-            return false;
-        }
-
-        if let None = &self.h3_engine {
-            self.h3_engine = Some(H3Engine::init().await);
-        }
-
-        self.h3_engine
-            .as_mut()
-            .unwrap()
-            .host_supports_h3(host)
-            .await
-    }
-
     async fn make_request(
-        &mut self,
+        &self,
         method: Method,
         url: String,
         body: Option<Vec<u8>>,
@@ -285,16 +243,10 @@ impl Impit {
     ) -> Result<Response, ErrorType> {
         let options = options.unwrap_or_default();
 
-        if options.http3_prior_knowledge && self.config.max_http_version < Version::HTTP_3 {
-            return Err(ErrorType::Http3Disabled);
-        }
-
         let parsed_url = self
             .parse_url(url.clone())
             .expect("URL should be a valid URL");
         let host = parsed_url.host_str().unwrap().to_string();
-
-        let h3 = options.http3_prior_knowledge || self.should_use_h3(&host).await;
 
         let headers = HttpHeaders::get_builder()
             .with_browser(&self.config.browser)
@@ -303,21 +255,11 @@ impl Impit {
             .with_custom_headers(&options.headers)
             .build();
 
-        let client = if h3 {
-            debug!("Using QUIC for request to {}", url);
-            self.h3_client.as_ref().unwrap()
-        } else {
-            debug!("{} doesn't seem to have HTTP3 support", url);
-            &self.base_client
-        };
+        let client = &self.base_client;
 
         let mut request = client
             .request(method.clone(), parsed_url)
             .headers(headers.into());
-
-        if h3 {
-            request = request.version(Version::HTTP_3);
-        }
 
         if let Some(timeout) = options.timeout {
             request = request.timeout(timeout);
@@ -336,23 +278,6 @@ impl Impit {
 
         let response = response.unwrap();
 
-        if !h3 {
-            if let Some(h3_engine) = self.h3_engine.as_mut() {
-                h3_engine.set_h3_support(&host, false);
-
-                if let Some(alt_svc) = response.headers().get("Alt-Svc") {
-                    let alt_svc = alt_svc.to_str().unwrap();
-                    if alt_svc.contains("h3") {
-                        debug!(
-                            "{} supports HTTP/3 (alt-svc header), adding to Alt-Svc cache",
-                            host
-                        );
-                        h3_engine.set_h3_support(&host, true);
-                    }
-                }
-            }
-        }
-
         Ok(response)
     }
 
@@ -363,7 +288,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn get(
-        &mut self,
+        &self,
         url: String,
         options: Option<RequestOptions>,
     ) -> Result<Response, ErrorType> {
@@ -377,7 +302,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn head(
-        &mut self,
+        &self,
         url: String,
         options: Option<RequestOptions>,
     ) -> Result<Response, ErrorType> {
@@ -391,7 +316,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn options(
-        &mut self,
+        &self,
         url: String,
         options: Option<RequestOptions>,
     ) -> Result<Response, ErrorType> {
@@ -405,7 +330,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn trace(
-        &mut self,
+        &self,
         url: String,
         options: Option<RequestOptions>,
     ) -> Result<Response, ErrorType> {
@@ -419,7 +344,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn delete(
-        &mut self,
+        &self,
         url: String,
         options: Option<RequestOptions>,
     ) -> Result<Response, ErrorType> {
@@ -433,7 +358,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn post(
-        &mut self,
+        &self,
         url: String,
         body: Option<Vec<u8>>,
         options: Option<RequestOptions>,
@@ -448,7 +373,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn put(
-        &mut self,
+        &self,
         url: String,
         body: Option<Vec<u8>>,
         options: Option<RequestOptions>,
@@ -463,7 +388,7 @@ impl Impit {
     ///
     /// If the request is successful, the `reqwest::Response` struct is returned.
     pub async fn patch(
-        &mut self,
+        &self,
         url: String,
         body: Option<Vec<u8>>,
         options: Option<RequestOptions>,
